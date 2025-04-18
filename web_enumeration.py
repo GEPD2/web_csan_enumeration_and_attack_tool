@@ -11,7 +11,9 @@ def check_tools():
     #checking if grep is installed and put the errors and everything to a file named NUL
     a.append(os.system("grep --version > NUL 2>&1"))
     #checking if hydra is installed and put the errors and everything to a file named NUL
-    a.append(os.system("hydra -h > NUL 2>&1"))
+    os.system("whereis hydra > see.txt 2>&1")
+    a.append(os.system("grep '/usr/bin/hydra' see.txt"))
+    os.system("rm see.txt")
     #removing the file,it's no longer needed
     os.system("rm NUL")
     #proccess of installing eveything
