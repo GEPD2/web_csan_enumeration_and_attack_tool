@@ -5,7 +5,7 @@
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?style=flat-square&logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey?style=flat-square&logo=linux&logoColor=white)
-![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)
+[![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](https://github.com/GEPD2/web_csan_enumeration_and_attack_tool/blob/main/LICENSE)
 ![Status](https://img.shields.io/badge/Status-Active%20Development-orange?style=flat-square)
 ![Tools](https://img.shields.io/badge/Tools-nmap%20%7C%20gobuster%20%7C%20hydra-red?style=flat-square)
 
