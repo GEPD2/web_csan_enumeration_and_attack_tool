@@ -1,0 +1,96 @@
+# web_csan .gitignore
+# Keeps scan results, secrets, and local cruft out of version control.
+
+# === Scan output & results (NEVER commit engagement data) ===
+# Default output location is ~/web_csan_output, but ignore it anywhere in-tree
+# in case OUTPUT_BASE_DIR is pointed at the repo.
+web_csan_output/
+*_output/
+output/
+results/
+scans/
+loot/
+
+# Per-session artifacts, wherever they land
+session.json
+targets.txt
+# Recon tool raw output
+httpx.jsonl
+whatweb.json
+wafw00f.json
+nuclei.jsonl
+*_enum.txt
+initial_scan.txt
+initial_scan.xml
+# Generated reports
+report.json
+report.html
+report.md
+report.csv
+# Generated shell payloads
+shell_*.php
+shell_*.sh
+shell_*.py
+shell_*.ps1
+
+# === Secrets & credentials (never commit) ===
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+*.ppk
+credentials
+credentials.*
+secrets.*
+*.secret
+*_token
+.netrc
+
+# Custom wordlists (often large / private)
+wordlists/
+*.wordlist
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.installed.cfg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test / coverage / type-check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# === Editors & OS ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# === Logs & temp ===
+*.log
+*.tmp
+*.temp

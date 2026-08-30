@@ -9,6 +9,12 @@ STEALTH_PROFILES = {
         "gobuster_delay": "500ms",
         "hydra_tasks": 4,
         "hydra_wait": 5,
+        # Real-world-tool tuning (httpx / nuclei / whatweb) -- kept slow and quiet
+        "httpx_threads": 5,
+        "httpx_rate_limit": 10,
+        "nuclei_concurrency": 5,
+        "nuclei_rate_limit": 10,
+        "whatweb_aggression": 1,     # 1 = stealthy (single, passive request)
         "description": "Maximum evasion. Slow but quiet. Mimics human browsing."
     },
     "stealth": {
@@ -18,6 +24,11 @@ STEALTH_PROFILES = {
         "gobuster_delay": "200ms",
         "hydra_tasks": 8,
         "hydra_wait": 3,
+        "httpx_threads": 10,
+        "httpx_rate_limit": 50,
+        "nuclei_concurrency": 10,
+        "nuclei_rate_limit": 50,
+        "whatweb_aggression": 1,
         "description": "Balanced evasion. Suitable for most engagements."
     },
     "normal": {
@@ -27,6 +38,11 @@ STEALTH_PROFILES = {
         "gobuster_delay": "0ms",
         "hydra_tasks": 16,
         "hydra_wait": 0,
+        "httpx_threads": 25,
+        "httpx_rate_limit": 150,
+        "nuclei_concurrency": 25,
+        "nuclei_rate_limit": 150,
+        "whatweb_aggression": 3,     # 3 = aggressive (follows leads, more requests)
         "description": "Default nmap timing. No evasion. Reasonable speed."
     },
     "aggressive": {
@@ -36,6 +52,11 @@ STEALTH_PROFILES = {
         "gobuster_delay": "0ms",
         "hydra_tasks": 32,
         "hydra_wait": 0,
+        "httpx_threads": 50,
+        "httpx_rate_limit": 500,
+        "nuclei_concurrency": 50,
+        "nuclei_rate_limit": 500,
+        "whatweb_aggression": 3,
         "description": "Fast and loud. Use only in isolated lab environments."
     }
 }
@@ -51,12 +72,58 @@ TOOL_BINARIES = {
     "grep":      "grep",
     "curl":      "curl",
     "nc":        "nc",
-    "whatweb":   "whatweb",   # WAF/tech fingerprinting
+    "whatweb":   "whatweb",   # deep tech fingerprinting
+    "httpx":     "httpx",     # ProjectDiscovery fast HTTP prober (see HTTPX_ALT_BINARY)
+    "wafw00f":   "wafw00f",   # WAF fingerprinting
+    "nuclei":    "nuclei",    # template-based vuln / exposure / tech detection
+    "sslscan":   "sslscan",   # TLS / cipher assessment
 }
+
+# ProjectDiscovery httpx clashes on the name "httpx" with the Python HTTP client
+# (pip package "httpx"). Distros such as Kali ship the scanner as "httpx-toolkit"
+# to avoid the collision. recon.py prefers this binary and verifies identity
+# before trusting whichever "httpx" is on PATH.
+HTTPX_ALT_BINARY = "httpx-toolkit"
 
 # Tools that are mandatory vs optional (optional ones degrade gracefully)
 MANDATORY_TOOLS = ["nmap", "gobuster", "hydra", "grep", "curl"]
-OPTIONAL_TOOLS  = ["whatweb", "nc"]
+OPTIONAL_TOOLS  = ["whatweb", "httpx", "wafw00f", "nuclei", "sslscan", "nc"]
+
+# Recon depth profiles -- control how much active scanning the recon phase does.
+# Independent of the stealth profile (which controls speed/noise per request).
+#   light    : fast triage -- probing + tech fingerprint + WAF, nuclei tech only
+#   standard : + exposures / misconfig / default-logins, http NSE scripts, TLS
+#   deep     : + CVE templates and nmap `vuln` NSE (loud, authorized engagements)
+RECON_DEPTH_PROFILES = {
+    "light": {
+        "nuclei_tags":     ["tech"],
+        "nuclei_severity": "",                       # no severity filter for tech
+        "nmap_scripts":    ["http-title", "http-headers"],
+        "run_vuln_nse":    False,
+        "run_tls":         False,
+        "run_nuclei":      True,
+        "description":     "Fast triage: probe + fingerprint + WAF + nuclei tech.",
+    },
+    "standard": {
+        "nuclei_tags":     ["tech", "exposure", "misconfiguration", "default-login"],
+        "nuclei_severity": "low,medium,high,critical",
+        "nmap_scripts":    ["http-enum", "http-title", "http-headers", "http-methods"],
+        "run_vuln_nse":    False,
+        "run_tls":         True,
+        "run_nuclei":      True,
+        "description":     "Balanced: adds exposures, misconfig, default-logins, TLS.",
+    },
+    "deep": {
+        "nuclei_tags":     ["tech", "exposure", "misconfiguration", "default-login", "cve"],
+        "nuclei_severity": "medium,high,critical",
+        "nmap_scripts":    ["http-enum", "http-title", "http-headers", "http-methods", "vuln"],
+        "run_vuln_nse":    True,
+        "run_tls":         True,
+        "run_nuclei":      True,
+        "description":     "Thorough: adds CVE templates and nmap vuln NSE. Loud.",
+    },
+}
+DEFAULT_RECON_DEPTH = "standard"
 
 # wordlists paths
 WORDLIST_DIRS = [
@@ -197,7 +264,9 @@ def build_shell(shell_type: str, lhost: str, lport: int) -> str | None:
     return template.replace("{LHOST}", lhost).replace("{LPORT}", str(lport))
 
 # Reporting formats
-REPORT_FORMATS = ["json", "html", "txt"]
+REPORT_FORMATS = ["json", "html", "markdown", "csv"]
+# Formats produced when the user asks for "all"
+REPORT_ALL_FORMATS = ["json", "html", "markdown", "csv"]
 # Default reporting format
 DEFAULT_REPORT_FORMAT = "json"
 

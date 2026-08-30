@@ -10,10 +10,13 @@
 
 import re
 import ssl
+import json
 import socket
+import shutil
 import subprocess
 import urllib.request
 import urllib.error
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Optional
 
@@ -22,6 +25,8 @@ from config.settings import (
     DEFAULT_STEALTH_PROFILE,
     PORT_PROFILES,
     DEFAULT_PORT_PROFILE,
+    RECON_DEPTH_PROFILES,
+    DEFAULT_RECON_DEPTH,
     ALL_WEB_PORTS,
     HTTP_PORTS,
     HTTPS_PORTS,
@@ -29,15 +34,23 @@ from config.settings import (
     WAF_BLOCK_CODES,
     DEFAULT_HEADERS,
     REQUEST_TIMEOUT,
+    HTTPX_ALT_BINARY,
 )
 from core.session import ScanSession, log
 from core.tools_manager import get_binary
+
+
+def _depth_config(recon_depth: str) -> dict:
+    # Returning the recon-depth profile dict, defaulting safely.
+    return RECON_DEPTH_PROFILES.get(recon_depth, RECON_DEPTH_PROFILES[DEFAULT_RECON_DEPTH])
 
 # Nmap scanning
 def run_nmap(
     session: ScanSession,
     tool_statuses: dict,
     port_profile: str = DEFAULT_PORT_PROFILE,
+    recon_depth: str = DEFAULT_RECON_DEPTH,
+    custom_ports: list = None,
 ) -> Path:
     """
     Running nmap against the session target using the session's stealth profile
@@ -63,8 +76,19 @@ def run_nmap(
     # Building argument list — NO shell=True, NO string formatting into a single shell command
     cmd = [nmap_bin, "-sV", "-sC", f"-{profile['nmap_timing']}"]
 
-    # Appending port spec
-    cmd += port_arg.split()
+    # Appending port spec. A custom --port overrides the port profile.
+    if custom_ports:
+        cmd += ["-p", ",".join(str(p) for p in custom_ports)]
+        log("info", f"  Custom ports: {','.join(str(p) for p in custom_ports)}")
+    else:
+        cmd += port_arg.split()
+
+    # NSE scripts driven by recon depth (http-enum, http-title, ... and vuln at deep)
+    depth   = _depth_config(recon_depth)
+    scripts = depth.get("nmap_scripts", [])
+    if scripts:
+        cmd += ["--script", ",".join(scripts)]
+        log("info", f"  NSE scripts: {','.join(scripts)}")
 
     # Appending extra timing/evasion flags if any
     if profile["nmap_extra"]:
@@ -152,7 +176,7 @@ def _parse_nmap_output(session: ScanSession, nmap_file: Path) -> None:
                 session.add_http_service(base_url, 0, version)  # status filled in by probe_http
 
 # http / https Service Probing
-def probe_http_services(session: ScanSession) -> list[dict]:
+def probe_http_services(session: ScanSession, custom_ports: list = None) -> list[dict]:
     """
     For each HTTP service found by nmap (or from ALL_WEB_PORTS as fallback),
     sending a HEAD + GET request to:
@@ -160,6 +184,9 @@ def probe_http_services(session: ScanSession) -> list[dict]:
         - Capture real HTTP status, Server header, and tech stack
         - Feed WAF detection
         - Auto-detect HTTPS vs HTTP
+
+    custom_ports (from --port) are always probed with https-then-http scheme
+    auto-detection so a user-specified non-standard port is never missed.
 
     Returning list of live service dicts for downstream use.
     """
@@ -180,6 +207,18 @@ def probe_http_services(session: ScanSession) -> list[dict]:
             proto = "https" if port in HTTPS_PORTS else "http"
             url   = f"{proto}://{target}" if port in (80, 443) else f"{proto}://{target}:{port}"
             targets_to_probe.append({"url": url, "port": port})
+
+    # Custom ports: auto-detect scheme (https wins if it responds) and add any
+    # not already covered by the candidates above.
+    if custom_ports:
+        known_ports = {t["port"] for t in targets_to_probe}
+        for port in custom_ports:
+            if port in known_ports:
+                continue
+            scheme = _detect_scheme(target, port)
+            url = f"{scheme}://{target}:{port}"
+            targets_to_probe.append({"url": url, "port": port})
+            log("info", f"  Custom port {port} detected as {scheme}")
 
     for item in targets_to_probe:
         url  = item["url"]
@@ -257,13 +296,25 @@ def _http_probe(url: str) -> Optional[dict]:
 
 
 def _extract_port(url: str) -> int:
-    # Extracting port from a URL string 
+    # Extracting port from a URL string
     # Returning 80 or 443 as defaults
     from urllib.parse import urlparse
     parsed = urlparse(url)
     if parsed.port:
         return parsed.port
     return 443 if parsed.scheme == "https" else 80
+
+
+def _detect_scheme(host: str, port: int) -> str:
+    # Deciding http vs https for a custom port by trying HTTPS first.
+    # An HTTPS listener (e.g. nginx) answers plain HTTP with a 400, which would
+    # otherwise register a bogus http service -- so HTTPS wins when it responds.
+    if _http_probe(f"https://{host}:{port}") is not None:
+        return "https"
+    if _http_probe(f"http://{host}:{port}") is not None:
+        return "http"
+    # Fall back to the well-known default for that port number
+    return "https" if port in HTTPS_PORTS else "http"
 
 # WAF Detection
 def detect_waf(
@@ -504,6 +555,430 @@ def grab_all_banners(session: ScanSession) -> dict[str, str]:
 
     return banners
 
+# Real-world tool integrations
+# Each wrapper is optional: if the tool is missing (or, for httpx, the wrong
+# binary is on PATH) it logs and returns without touching findings, so the
+# built-in probes above remain the fallback.
+
+def _run_tool(cmd: list, timeout: int = 300) -> Optional[subprocess.CompletedProcess]:
+    # Running an external tool with an argument list (no shell) and a hard timeout.
+    # Returning the CompletedProcess, or None on timeout / missing binary.
+    log("info", f"  $ {' '.join(cmd)}")
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        log("warning", f"  Tool timed out after {timeout}s: {cmd[0]}")
+        return None
+    except FileNotFoundError:
+        log("warning", f"  Binary not found: {cmd[0]}")
+        return None
+
+
+def _is_pd_httpx(binary: str) -> bool:
+    """
+    Verifying a binary is ProjectDiscovery httpx and NOT the Python 'httpx'
+    HTTP client, which shares the name. PD httpx accepts '-version' and prints
+    a version banner; the Python client rejects it (click parses '-version'
+    as unknown options). This collision is common on systems where pip's httpx
+    is installed -- Kali ships the scanner separately as 'httpx-toolkit'.
+    """
+    try:
+        res = subprocess.run([binary, "-version"], capture_output=True,
+                             text=True, timeout=8)
+    except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError, OSError):
+        return False
+    blob = f"{res.stdout}\n{res.stderr}".lower()
+    if "no such option" in blob or "usage: httpx <url>" in blob:
+        return False   # Python httpx client
+    # PD httpx prints e.g. "[INF] Current httpx version v1.6.0"
+    return res.returncode == 0 and "version" in blob
+
+
+def resolve_httpx_binary(tool_statuses: dict) -> Optional[str]:
+    # Returning a usable ProjectDiscovery httpx binary path, or None.
+    # Prefers the collision-free 'httpx-toolkit', then a verified 'httpx'.
+    candidates = []
+    alt = shutil.which(HTTPX_ALT_BINARY)
+    if alt:
+        candidates.append(alt)
+    primary = get_binary(tool_statuses, "httpx")
+    if primary:
+        candidates.append(primary)
+
+    for cand in candidates:
+        if _is_pd_httpx(cand):
+            return cand
+
+    if primary and not alt:
+        log("warning",
+            "'httpx' on PATH is the Python HTTP client, not ProjectDiscovery httpx. "
+            f"Install the scanner (e.g. 'apt install {HTTPX_ALT_BINARY}' or "
+            "'go install github.com/projectdiscovery/httpx/cmd/httpx@latest'). "
+            "Falling back to the built-in prober.")
+    return None
+
+
+def _parse_httpx_obj(obj: dict) -> Optional[dict]:
+    # Normalizing one ProjectDiscovery httpx JSON object into a service dict.
+    # Returning None when there is no usable URL.
+    url = obj.get("url") or obj.get("input") or ""
+    if not url:
+        return None
+    status = obj.get("status_code", 0) or 0
+    server = obj.get("webserver", "") or ""
+    title  = obj.get("title", "") or ""
+    tech   = obj.get("tech", []) or obj.get("technologies", []) or []
+    cdn    = obj.get("cdn_name", "") or obj.get("cdn", "")
+    tls    = obj.get("tls", {}) or {}
+
+    tech_display = list(tech)
+    if cdn:
+        tech_display.append(f"CDN:{cdn}")
+    if title:
+        tech_display.append(f"Title:{title[:60]}")
+    return {
+        "url": url, "status": status, "server": server, "title": title,
+        "tech": list(tech), "tech_display": tech_display, "cdn": cdn, "tls": tls,
+    }
+
+
+def _parse_nuclei_obj(obj: dict) -> dict:
+    # Normalizing one nuclei JSONL object into a vulnerability finding dict.
+    info     = obj.get("info", {}) or {}
+    name     = info.get("name", obj.get("template-id", "unknown"))
+    severity = info.get("severity", "unknown")
+    url      = obj.get("matched-at") or obj.get("host") or obj.get("matched") or ""
+    template = obj.get("template-id", "")
+    return {"name": name, "severity": severity, "url": url, "template": template}
+
+
+def _write_url_list(session: ScanSession, urls: list) -> Path:
+    # Writing a deduplicated URL list to the nmap subdir for tool -l input.
+    path = session.artifact_path("recon", "targets.txt")
+    seen, ordered = set(), []
+    for u in urls:
+        if u and u not in seen:
+            seen.add(u)
+            ordered.append(u)
+    path.write_text("\n".join(ordered) + ("\n" if ordered else ""))
+    return path
+
+
+def run_httpx(session: ScanSession, tool_statuses: dict, urls: list) -> dict:
+    """
+    ProjectDiscovery httpx: fast, accurate probing of the candidate URLs.
+    Captures status, page title, detected technologies, web server, CDN, and
+    TLS metadata in one pass, enriching the http_services findings.
+
+    Returning {url: parsed_dict}. Empty dict if httpx is unavailable.
+    """
+    binary = resolve_httpx_binary(tool_statuses)
+    if not binary or not urls:
+        return {}
+
+    profile   = STEALTH_PROFILES.get(session.stealth_profile, STEALTH_PROFILES[DEFAULT_STEALTH_PROFILE])
+    url_file  = _write_url_list(session, urls)
+    out_file  = session.artifact_path("recon", "httpx.jsonl")
+
+    cmd = [
+        binary,
+        "-l", str(url_file),
+        "-json",
+        "-silent", "-no-color",
+        "-status-code", "-title", "-tech-detect",
+        "-web-server", "-tls-grab", "-follow-redirects",
+        "-timeout", str(REQUEST_TIMEOUT),
+        "-threads", str(profile.get("httpx_threads", 10)),
+        "-rate-limit", str(profile.get("httpx_rate_limit", 50)),
+        "-o", str(out_file),
+    ]
+    log("info", f"httpx probing {len(urls)} URL(s)...")
+    res = _run_tool(cmd, timeout=300)
+    if res is None:
+        return {}
+
+    parsed = {}
+    raw = ""
+    if out_file.exists():
+        raw = out_file.read_text(errors="replace")
+    if not raw.strip():
+        raw = res.stdout or ""   # some builds only emit to stdout
+
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        rec = _parse_httpx_obj(obj)
+        if rec is None:
+            continue
+        session.add_http_service(rec["url"], rec["status"], rec["server"], rec["tech_display"])
+        parsed[rec["url"]] = {
+            "status": rec["status"], "server": rec["server"], "title": rec["title"],
+            "tech": rec["tech"], "cdn": rec["cdn"], "tls": rec["tls"],
+        }
+
+    if parsed:
+        log("success", f"httpx confirmed {len(parsed)} live service(s).")
+    return parsed
+
+
+# whatweb plugin keys that are metadata rather than a technology signal
+_WHATWEB_NOISE = {
+    "ip", "country", "title", "uncommonheaders", "allow", "html5",
+    "cookies", "email", "redirectlocation", "meta-refresh-redirect",
+}
+
+
+def run_whatweb(session: ScanSession, tool_statuses: dict, urls: list) -> dict:
+    """
+    whatweb deep technology fingerprinting. Aggression level scales with the
+    stealth profile (1 = passive single request, 3 = follows leads).
+    Returning {url: [tech, ...]}. Empty if whatweb is unavailable.
+    """
+    binary = get_binary(tool_statuses, "whatweb")
+    if not binary or not urls:
+        return {}
+
+    profile    = STEALTH_PROFILES.get(session.stealth_profile, STEALTH_PROFILES[DEFAULT_STEALTH_PROFILE])
+    aggression = profile.get("whatweb_aggression", 1)
+    out_file   = session.artifact_path("recon", "whatweb.json")
+
+    cmd = [binary, "--quiet", f"--aggression={aggression}",
+           f"--log-json={out_file}"] + list(urls)
+    log("info", f"whatweb fingerprinting {len(urls)} URL(s) (aggression={aggression})...")
+    if _run_tool(cmd, timeout=240) is None:
+        return {}
+    if not out_file.exists():
+        return {}
+
+    try:
+        entries = json.loads(out_file.read_text(errors="replace") or "[]")
+    except json.JSONDecodeError:
+        log("warning", "  Could not parse whatweb JSON output.")
+        return {}
+
+    results = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        target  = entry.get("target", "")
+        plugins = entry.get("plugins", {}) or {}
+        techs = []
+        for name, meta in plugins.items():
+            if name.lower() in _WHATWEB_NOISE:
+                continue
+            version = ""
+            if isinstance(meta, dict):
+                ver = meta.get("version") or meta.get("string")
+                if isinstance(ver, list) and ver:
+                    version = str(ver[0])
+                elif isinstance(ver, str):
+                    version = ver
+            techs.append(f"{name}[{version}]" if version else name)
+        if target and techs:
+            results[target] = techs
+            _merge_tech(session, target, techs)
+            log("info", f"  {target}: {', '.join(techs[:8])}")
+    return results
+
+
+def _merge_tech(session: ScanSession, url: str, techs: list) -> None:
+    # Merging newly-found tech into an existing http_service entry (dedup),
+    # or recording it as an event if the service was not already tracked.
+    for svc in session.findings["http_services"]:
+        if svc["url"].rstrip("/") == url.rstrip("/"):
+            existing = svc.setdefault("tech", [])
+            for t in techs:
+                if t not in existing:
+                    existing.append(t)
+            return
+    session.record("tech_fingerprint", {"url": url, "tech": techs})
+
+
+def run_wafw00f(session: ScanSession, tool_statuses: dict, urls: list) -> dict:
+    """
+    wafw00f authoritative WAF fingerprinting. Names the specific WAF product
+    where the built-in signature list can only guess. Feeds the same
+    waf_detected findings that the auth phase uses to back off hydra.
+    Returning {url: firewall_name}. Empty if wafw00f is unavailable.
+    """
+    binary = get_binary(tool_statuses, "wafw00f")
+    if not binary or not urls:
+        return {}
+
+    out_file = session.artifact_path("recon", "wafw00f.json")
+    cmd = [binary, "-o", str(out_file), "-f", "json"] + list(urls)
+    log("info", f"wafw00f checking {len(urls)} URL(s)...")
+    if _run_tool(cmd, timeout=180) is None:
+        return {}
+    if not out_file.exists():
+        return {}
+
+    try:
+        entries = json.loads(out_file.read_text(errors="replace") or "[]")
+    except json.JSONDecodeError:
+        return {}
+
+    results = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or not entry.get("detected"):
+            continue
+        url      = entry.get("url", "")
+        firewall = entry.get("firewall", "Unknown")
+        vendor   = entry.get("manufacturer", "")
+        evidence = f"wafw00f: {firewall}" + (f" ({vendor})" if vendor else "")
+        session.add_waf(firewall, evidence)
+        results[url] = firewall
+    return results
+
+
+def run_nuclei(
+    session: ScanSession,
+    tool_statuses: dict,
+    urls: list,
+    recon_depth: str = DEFAULT_RECON_DEPTH,
+) -> list:
+    """
+    nuclei template-based scanning. Tags and severity floor are driven by the
+    recon depth (light = tech only; standard = + exposure/misconfig/default-login;
+    deep = + CVE). Rate/concurrency follow the stealth profile. Findings feed the
+    vulnerabilities bucket that drives the report's severity charts.
+    Returning a list of parsed finding dicts. Empty if nuclei is unavailable.
+    """
+    binary = get_binary(tool_statuses, "nuclei")
+    depth  = _depth_config(recon_depth)
+    if not binary or not urls or not depth.get("run_nuclei", True):
+        return []
+
+    profile   = STEALTH_PROFILES.get(session.stealth_profile, STEALTH_PROFILES[DEFAULT_STEALTH_PROFILE])
+    url_file  = _write_url_list(session, urls)
+    out_file  = session.artifact_path("recon", "nuclei.jsonl")
+
+    cmd = [
+        binary,
+        "-l", str(url_file),
+        "-jsonl", "-o", str(out_file),
+        "-silent", "-no-color",
+        "-disable-update-check",           # keep the template-update table off stdout
+        "-rate-limit", str(profile.get("nuclei_rate_limit", 50)),
+        "-c", str(profile.get("nuclei_concurrency", 10)),
+        "-timeout", str(REQUEST_TIMEOUT),
+    ]
+    tags = depth.get("nuclei_tags", [])
+    if tags:
+        cmd += ["-tags", ",".join(tags)]
+    severity = depth.get("nuclei_severity", "")
+    if severity:
+        cmd += ["-severity", severity]
+
+    log("info", f"nuclei scanning {len(urls)} URL(s) | tags={','.join(tags) or 'all'} "
+                f"| severity={severity or 'any'}")
+    # nuclei can be slow; scale timeout with depth
+    tmo = 900 if recon_depth == "deep" else 480
+    if _run_tool(cmd, timeout=tmo) is None:
+        return []
+
+    findings = []
+    if not out_file.exists():
+        return findings
+    for line in out_file.read_text(errors="replace").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        rec = _parse_nuclei_obj(obj)
+        session.add_vulnerability(rec["name"], rec["severity"], rec["url"],
+                                  source="nuclei", template=rec["template"], matched=rec["url"])
+        findings.append(rec)
+    log("success", f"nuclei found {len(findings)} finding(s).")
+    return findings
+
+
+def run_tls_scan(session: ScanSession, tool_statuses: dict, https_urls: list) -> dict:
+    """
+    sslscan TLS / cipher assessment on live HTTPS services. Flags legacy
+    protocols (SSLv2/3, TLS 1.0/1.1), weak ciphers, and expired certificates --
+    and surfaces certificate SANs, which frequently leak internal hostnames.
+    Returning {host:port: tls_dict}. Empty if sslscan is unavailable.
+    """
+    binary = get_binary(tool_statuses, "sslscan")
+    if not binary or not https_urls:
+        return {}
+
+    results = {}
+    for url in https_urls:
+        host = _host_from_url(url)
+        port = _extract_port(url)
+        target = f"{host}:{port}"
+        cmd = [binary, "--no-colour", "--xml=-", target]
+        log("info", f"sslscan assessing {target}...")
+        res = _run_tool(cmd, timeout=120)
+        if res is None or not res.stdout:
+            continue
+        info = _parse_sslscan_xml(res.stdout)
+        if info:
+            session.add_tls(url, info)
+            results[target] = info
+    return results
+
+
+def _host_from_url(url: str) -> str:
+    from urllib.parse import urlparse
+    return urlparse(url).hostname or url
+
+
+def _parse_sslscan_xml(xml_text: str) -> dict:
+    # Parsing sslscan --xml output into a compact TLS summary with issue flags.
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return {}
+
+    protocols, weak_ciphers, issues = [], [], []
+    for proto in root.iter("protocol"):
+        if proto.get("enabled") == "1":
+            ptype = proto.get("type", "")
+            pver  = proto.get("version", "")
+            label = f"{ptype}{pver}".upper()
+            protocols.append(label)
+            if (ptype == "ssl") or (ptype == "tls" and pver in ("1.0", "1.1")):
+                issues.append(f"legacy protocol {label}")
+
+    for cipher in root.iter("cipher"):
+        strength = (cipher.get("strength", "") or "").lower()
+        name     = cipher.get("cipher", "")
+        if strength in ("weak", "null", "anonymous"):
+            weak_ciphers.append(name)
+
+    cert = {}
+    for c in root.iter("certificate"):
+        subj = c.findtext("subject")
+        if subj:
+            cert["subject"] = subj
+        not_after = c.findtext("not-valid-after")
+        if not_after:
+            cert["expires"] = not_after
+        expired_flag = (c.findtext("expired") or "").strip().lower()
+        if expired_flag in ("true", "1"):
+            issues.append("certificate expired")
+    if weak_ciphers:
+        issues.append(f"{len(weak_ciphers)} weak cipher(s)")
+
+    return {
+        "protocols":    protocols,
+        "weak_ciphers": weak_ciphers[:20],
+        "cert":         cert,
+        "issues":       issues,
+    }
+
+
 # Full Recon Pipeline
 # Single call that runs the complete recon phase in correct order
 def run_recon(
@@ -511,28 +986,62 @@ def run_recon(
     tool_statuses: dict,
     port_profile: str = DEFAULT_PORT_PROFILE,
     skip_waf_probe: bool = False,
+    recon_depth: str = DEFAULT_RECON_DEPTH,
+    custom_ports: list = None,
 ) -> dict:
     """
-    Orchestrating the full recon phase:
-        1. nmap port scan
-        2. http/https service probing + tech fingerprinting
-        3. WAF detection (passive, from probe responses)
-        4. WAF evasion probe (active, on each live service) — skippable
-        5. Banner grabbing on all open ports
+    Orchestrating the full recon phase. Real-world tools drive each step when
+    present; the built-in probes are the fallback so recon never hard-fails.
+
+        1. nmap port scan (+ NSE http scripts / vuln by depth)
+        2. built-in HTTP probe -- liveness gate + passive WAF + tech fallback
+        3. httpx      -- fast accurate probe: status, title, tech, CDN, TLS
+        4. whatweb    -- deep technology fingerprint
+        5. wafw00f    -- authoritative WAF naming (feeds hydra backoff)
+        6. nuclei     -- template vuln / exposure / misconfig / CVE scan
+        7. TLS scan   -- sslscan cipher / protocol / cert assessment (HTTPS)
+        8. WAF evasion probe (active, differential) -- skippable
+        9. Banner grabbing on all open ports
 
     Returning a summary dict consumed by main.py and downstream modules.
     """
+    depth = _depth_config(recon_depth)
     log("info", "="*55)
-    log("info", f"  RECON PHASE — target: {session.target['value']}")
+    log("info", f"  RECON PHASE -- target: {session.target['value']}")
+    log("info", f"  depth={recon_depth} ({depth['description']})")
     log("info", "="*55)
 
-    # 1. nmap
-    nmap_out = run_nmap(session, tool_statuses, port_profile)
+    # 1. nmap (depth-aware NSE scripts; custom --port overrides the profile)
+    nmap_out = run_nmap(session, tool_statuses, port_profile, recon_depth, custom_ports)
 
-    # 2. http probing + passive WAF detection
-    live_services = probe_http_services(session)
+    # 2. Built-in probe: confirms liveness, passive WAF, tech fallback
+    live_services = probe_http_services(session, custom_ports=custom_ports)
+    live_urls = [svc["url"] for svc in live_services]
 
-    # 3. Active WAF evasion probing (per live service)
+    # If the built-in probe found nothing but nmap saw web services, still try
+    # the external tools against the recorded service URLs.
+    if not live_urls and session.findings["http_services"]:
+        live_urls = [s["url"] for s in session.findings["http_services"]]
+
+    # 3. httpx -- fast accurate enrichment
+    httpx_results = run_httpx(session, tool_statuses, live_urls)
+
+    # 4. whatweb -- deep tech fingerprint
+    whatweb_results = run_whatweb(session, tool_statuses, live_urls)
+
+    # 5. wafw00f -- authoritative WAF naming
+    wafw00f_results = run_wafw00f(session, tool_statuses, live_urls)
+
+    # 6. nuclei -- template scanning
+    nuclei_findings = run_nuclei(session, tool_statuses, live_urls, recon_depth)
+
+    # 7. TLS assessment on HTTPS services (depth-gated)
+    tls_results = {}
+    if depth.get("run_tls"):
+        https_urls = [u for u in live_urls if u.lower().startswith("https://")]
+        tls_results = run_tls_scan(session, tool_statuses, https_urls)
+
+    # 8. Active WAF evasion probing (per live service)
     waf_evasion_results = {}
     if not skip_waf_probe and live_services:
         log("info", "Running active WAF evasion probes...")
@@ -540,16 +1049,24 @@ def run_recon(
             evasion = probe_waf_evasion(svc["url"])
             waf_evasion_results[svc["url"]] = evasion
 
-    # 4. Banner grabbing
+    # 9. Banner grabbing
     banners = grab_all_banners(session)
 
     summary = {
-        "open_ports":    session.findings["open_ports"],
-        "http_services": live_services,
-        "waf_detected":  session.findings["waf_detected"],
-        "waf_evasion":   waf_evasion_results,
-        "banners":       banners,
-        "nmap_file":     str(nmap_out),
+        "recon_depth":     recon_depth,
+        "open_ports":      session.findings["open_ports"],
+        "http_services":   session.findings["http_services"],
+        "waf_detected":    session.findings["waf_detected"],
+        "vulnerabilities": session.findings["vulnerabilities"],
+        "tls":             session.findings["tls"],
+        "httpx":           httpx_results,
+        "whatweb":         whatweb_results,
+        "wafw00f":         wafw00f_results,
+        "nuclei":          nuclei_findings,
+        "tls_scan":        tls_results,
+        "waf_evasion":     waf_evasion_results,
+        "banners":         banners,
+        "nmap_file":       str(nmap_out),
     }
 
     log("success", "Recon phase complete.")

@@ -18,7 +18,10 @@ from config.settings import (
     PORT_PROFILES,
     DEFAULT_STEALTH_PROFILE,
     DEFAULT_PORT_PROFILE,
+    RECON_DEPTH_PROFILES,
+    DEFAULT_RECON_DEPTH,
     REPORT_FORMATS,
+    REPORT_ALL_FORMATS,
 )
 from core.session     import log, ScanSession, MultiTargetSession
 from core.validator   import (
@@ -101,6 +104,31 @@ Examples:
         )
     )
 
+    # Custom target port(s)
+    parser.add_argument(
+        "--port", "--target-port",
+        dest="port",
+        metavar="PORTS",
+        help=(
+            "Scan specific port(s) instead of a --ports profile. "
+            "Comma-separated, e.g. '8420' or '8080,8443'. "
+            "Scheme (http/https) is auto-detected."
+        )
+    )
+
+    # Recon depth
+    parser.add_argument(
+        "--recon-depth",
+        choices=list(RECON_DEPTH_PROFILES.keys()),
+        default=DEFAULT_RECON_DEPTH,
+        metavar="DEPTH",
+        help=(
+            "How much active recon to run (nuclei tags, NSE scripts, TLS). "
+            f"Choices: {list(RECON_DEPTH_PROFILES.keys())}. "
+            f"Default: {DEFAULT_RECON_DEPTH}"
+        )
+    )
+
     # Phase control
     parser.add_argument(
         "--phase",
@@ -129,7 +157,8 @@ Examples:
         "--report",
         choices=REPORT_FORMATS + ["all"],
         default="all",
-        help="Report format(s). Default: all (json + html)."
+        help=f"Report format(s). Choices: {REPORT_FORMATS + ['all']}. "
+             "Default: all (json + html + markdown + csv)."
     )
 
     # Extra options
@@ -151,6 +180,28 @@ Examples:
     )
 
     return parser
+
+# Custom port parsing
+def parse_custom_ports(raw: str) -> list:
+    # Parsing a comma-separated --port value into a validated list of ints.
+    # Exiting with an error on any out-of-range or non-numeric entry.
+    if not raw:
+        return None
+    ports = []
+    for chunk in raw.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if not chunk.isdigit():
+            log("error", f"Invalid port '{chunk}' — ports must be numeric.")
+            sys.exit(1)
+        p = int(chunk)
+        if not (1 <= p <= 65535):
+            log("error", f"Port {p} out of range (1-65535).")
+            sys.exit(1)
+        ports.append(p)
+    return ports or None
+
 
 # Phase Rersolver
 def resolve_phases(args: argparse.Namespace) -> list[str]:
@@ -185,7 +236,7 @@ def scan_target(
 
     # Determining report formats
     report_formats = (
-        ["json", "html"] if args.report == "all"
+        list(REPORT_ALL_FORMATS) if args.report == "all"
         else [args.report]
     )
 
@@ -195,6 +246,8 @@ def scan_target(
             session, tool_statuses,
             port_profile=args.ports,
             skip_waf_probe=args.skip_waf_probe,
+            recon_depth=args.recon_depth,
+            custom_ports=getattr(args, "custom_ports", None),
         )
 
     # Enumeration
@@ -293,9 +346,15 @@ def main() -> None:
     # Phase resolution
     phases = resolve_phases(args)
 
+    # Custom port resolution (validated early so bad input fails fast)
+    args.custom_ports = parse_custom_ports(args.port)
+
     # Stealth profile info
     profile_info = STEALTH_PROFILES[args.profile]
     log("info", f"Stealth profile : {args.profile} — {profile_info['description']}")
+    log("info", f"Recon depth     : {args.recon_depth} — {RECON_DEPTH_PROFILES[args.recon_depth]['description']}")
+    if args.custom_ports:
+        log("info", f"Custom ports    : {','.join(str(p) for p in args.custom_ports)} (overrides --ports)")
     log("info", f"Phases          : {' → '.join(phases)}")
     log("info", f"Targets         : {len(targets)}")
 

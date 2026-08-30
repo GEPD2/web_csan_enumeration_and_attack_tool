@@ -61,7 +61,7 @@ class ScanSession:
             report/             ← final HTML / JSON reports
     """
 
-    SUBDIRS = ["nmap", "gobuster", "hydra", "shells", "report"]
+    SUBDIRS = ["nmap", "recon", "gobuster", "hydra", "shells", "report"]
 
     def __init__(self, target: dict, stealth_profile: str = "stealth"):
         self.target          = target
@@ -70,13 +70,15 @@ class ScanSession:
         self.events: list    = []          # structured event log
         self.artifacts: list = []          # all files written this session
         self.findings: dict  = {           # aggregated discoveries
-            "open_ports":    [],
-            "http_services": [],
-            "waf_detected":  [],
-            "directories":   [],
-            "admin_pages":   [],
-            "credentials":   [],
-            "shells":        [],
+            "open_ports":     [],
+            "http_services":  [],
+            "waf_detected":   [],
+            "directories":    [],
+            "admin_pages":    [],
+            "credentials":    [],
+            "shells":         [],
+            "vulnerabilities": [],         # nuclei / nmap-vuln / nikto findings
+            "tls":             [],         # per-service TLS / cipher assessment
         }
 
         # Build session directory
@@ -148,7 +150,22 @@ class ScanSession:
         log("found", f"Open port: {port}/{protocol} → {service} {version}".strip())
 
     def add_http_service(self, url: str, status: int, server: str = "", tech: list = None) -> None:
-        entry = {"url": url, "status": status, "server": server, "tech": tech or []}
+        tech = tech or []
+        # Merge into an existing entry for the same URL (nmap seeds status 0,
+        # the prober/httpx later fill in the real status, server, and tech) so
+        # a single service is never counted twice.
+        for entry in self.findings["http_services"]:
+            if entry["url"].rstrip("/") == url.rstrip("/"):
+                if status:
+                    entry["status"] = status
+                if server:
+                    entry["server"] = server
+                for t in tech:
+                    if t not in entry["tech"]:
+                        entry["tech"].append(t)
+                self.record("http_service", entry)
+                return
+        entry = {"url": url, "status": status, "server": server, "tech": tech}
         self.findings["http_services"].append(entry)
         self.record("http_service", entry)
         log("found", f"HTTP service: {url} [{status}] server={server}")
@@ -183,6 +200,42 @@ class ScanSession:
         self.record("shell_generated", entry)
         log("success", f"Shell payload written: {path} [{shell_type}]")
 
+    def add_vulnerability(
+        self,
+        name: str,
+        severity: str,
+        url: str,
+        source: str = "nuclei",
+        template: str = "",
+        matched: str = "",
+    ) -> None:
+        # Recording a vulnerability / exposure / misconfiguration finding.
+        # severity: "critical" | "high" | "medium" | "low" | "info" | "unknown"
+        entry = {
+            "name":     name,
+            "severity": (severity or "unknown").lower(),
+            "url":      url,
+            "source":   source,
+            "template": template,
+            "matched":  matched,
+        }
+        self.findings["vulnerabilities"].append(entry)
+        self.record("vulnerability", entry)
+        level = "attack" if entry["severity"] in ("critical", "high") else "found"
+        log(level, f"[{entry['severity'].upper()}] {name} @ {url} ({source})")
+
+    def add_tls(self, url: str, data: dict) -> None:
+        # Recording a TLS / cipher assessment for one HTTPS service.
+        # data typically holds keys such as protocols, weak_ciphers, cert, issues.
+        entry = {"url": url, **data}
+        self.findings["tls"].append(entry)
+        self.record("tls_info", entry)
+        issues = data.get("issues", [])
+        if issues:
+            log("warning", f"TLS issues on {url}: {', '.join(issues[:3])}")
+        else:
+            log("info", f"TLS assessed: {url}")
+
     # Summary Print
     def print_summary(self) -> None:
         print(f"\n{_Colors.BOLD}{'='*60}{_Colors.RESET}")
@@ -191,6 +244,8 @@ class ScanSession:
         print(f"  Open ports    : {len(self.findings['open_ports'])}")
         print(f"  HTTP services : {len(self.findings['http_services'])}")
         print(f"  WAF detected  : {len(self.findings['waf_detected'])}")
+        print(f"  Vulnerabilities: {len(self.findings['vulnerabilities'])}")
+        print(f"  TLS assessed  : {len(self.findings['tls'])}")
         print(f"  Directories   : {len(self.findings['directories'])}")
         print(f"  Admin pages   : {len(self.findings['admin_pages'])}")
         print(f"  Credentials   : {len(self.findings['credentials'])}")
@@ -202,15 +257,23 @@ class ScanSession:
 
     # Cleanup & Finalization
     def _finalize(self) -> None:
-        # Called on normal exit via atexit and Writes session close event
+        # Called on normal exit via atexit and Writes session close event.
+        # Guarded so a removed/unwritable session dir (e.g. cleaned up in tests
+        # or on a full disk) never raises from an atexit callback.
+        if getattr(self, "_finalized", False):
+            return
+        self._finalized = True
         closed_at = datetime.datetime.utcnow()
         footer = {
             "type":     "session_end",
             "ended":    closed_at.isoformat(),
             "findings": self.findings,
         }
-        with open(self.session_log_path, "a") as f:
-            f.write(json.dumps(footer) + "\n")
+        try:
+            with open(self.session_log_path, "a") as f:
+                f.write(json.dumps(footer) + "\n")
+        except OSError:
+            return
         self.print_summary()
 
     def _handle_sigint(self, signum, frame) -> None:

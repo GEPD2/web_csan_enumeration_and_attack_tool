@@ -262,6 +262,60 @@ PACKAGE_NAMES: dict[str, dict[str, str]] = {
         "macos":     "whatweb",
         "windows":   "__manual__",
     },
+    "httpx": {
+        # ProjectDiscovery httpx. go install is the reliable cross-distro path
+        # (the name "httpx" collides with the Python pip package on many repos).
+        "debian":    "__go_install__",
+        "fedora":    "__go_install__",
+        "arch":      "__go_install__",
+        "suse":      "__go_install__",
+        "void":      "__go_install__",
+        "alpine":    "__go_install__",
+        "solus":     "__go_install__",
+        "gentoo":    "__manual__",
+        "slackware": "__manual__",
+        "macos":     "httpx",          # homebrew formula = ProjectDiscovery httpx
+        "windows":   "__go_install__",
+    },
+    "nuclei": {
+        "debian":    "__go_install__",
+        "fedora":    "__go_install__",
+        "arch":      "nuclei",         # BlackArch / AUR
+        "suse":      "__go_install__",
+        "void":      "__go_install__",
+        "alpine":    "__go_install__",
+        "solus":     "__go_install__",
+        "gentoo":    "__manual__",
+        "slackware": "__manual__",
+        "macos":     "nuclei",
+        "windows":   "__go_install__",
+    },
+    "wafw00f": {
+        "debian":    "wafw00f",
+        "fedora":    "__pip_install__",
+        "arch":      "wafw00f",        # AUR
+        "suse":      "__pip_install__",
+        "void":      "__pip_install__",
+        "alpine":    "__pip_install__",
+        "solus":     "__pip_install__",
+        "gentoo":    "__pip_install__",
+        "slackware": "__pip_install__",
+        "macos":     "__pip_install__",
+        "windows":   "__pip_install__",
+    },
+    "sslscan": {
+        "debian":    "sslscan",
+        "fedora":    "sslscan",
+        "arch":      "sslscan",
+        "suse":      "sslscan",
+        "void":      "sslscan",
+        "alpine":    "sslscan",
+        "solus":     "__manual__",
+        "gentoo":    "__manual__",
+        "slackware": "__manual__",
+        "macos":     "sslscan",
+        "windows":   "__manual__",
+    },
     "nc": {
         "debian":    "netcat-openbsd",
         "fedora":    "nmap-ncat",      # Fedora ships ncat as part of nmap
@@ -285,12 +339,23 @@ WINGET_IDS: dict[str, str] = {
     "gobuster":"__go_install__",
     "hydra":   "__manual__",
     "whatweb": "__manual__",
+    "httpx":   "__go_install__",
+    "nuclei":  "__go_install__",
+    "wafw00f": "__pip_install__",
+    "sslscan": "__manual__",
     "nc":      "__manual__",
 }
 
 # Go module paths for __go_install__ tools
 GO_INSTALL_PATHS: dict[str, str] = {
     "gobuster": "github.com/OJ/gobuster/v3@latest",
+    "httpx":    "github.com/projectdiscovery/httpx/cmd/httpx@latest",
+    "nuclei":   "github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest",
+}
+
+# pip package names for __pip_install__ tools
+PIP_INSTALL_PATHS: dict[str, str] = {
+    "wafw00f": "wafw00f",
 }
 
 # Packge Manager Abstraction
@@ -358,6 +423,8 @@ class PackageManager:
             return self._handle_manual(tool_name)
         if pkg_name == "__go_install__":
             return self._go_install(tool_name)
+        if pkg_name == "__pip_install__":
+            return self._pip_install(tool_name)
         if self.profile.os_name == "windows":
             return self._windows_install(tool_name, pkg_name)
         if self.profile.os_name == "macos":
@@ -422,6 +489,8 @@ class PackageManager:
                 return self._handle_manual(tool_name)
             if winget_id == "__go_install__":
                 return self._go_install(tool_name)
+            if winget_id == "__pip_install__":
+                return self._pip_install(tool_name)
             cmd = [
                 "winget", "install",
                 "--id", winget_id,
@@ -476,6 +545,40 @@ class PackageManager:
             return result.returncode == 0
         except subprocess.TimeoutExpired:
             log("error", f"go install timed out for '{tool_name}'.")
+            return False
+
+    # pip install (Python-based tools, e.g. wafw00f)
+    def _pip_install(self, tool_name: str) -> bool:
+        pip_pkg = PIP_INSTALL_PATHS.get(tool_name, tool_name)
+
+        # Prefer pipx (isolated, avoids PEP 668 externally-managed-env errors),
+        # then fall back to pip with --user / --break-system-packages as needed.
+        if shutil.which("pipx"):
+            cmd = ["pipx", "install", pip_pkg]
+        else:
+            pip_bin = shutil.which("pip3") or shutil.which("pip")
+            if not pip_bin:
+                log("error",
+                    f"Neither pipx nor pip found — required to install {tool_name}.\n"
+                    f"  Install pipx: https://pipx.pypa.io  then: pipx install {pip_pkg}"
+                )
+                return False
+            cmd = [pip_bin, "install", "--user", pip_pkg]
+
+        log("info", f"  $ {' '.join(cmd)}")
+        try:
+            result = subprocess.run(cmd, timeout=300)
+            if result.returncode == 0:
+                return True
+            # PEP 668 externally-managed environments reject plain pip installs.
+            # Retry once with --break-system-packages when using pip (not pipx).
+            if cmd[0].endswith(("pip", "pip3")):
+                retry = cmd + ["--break-system-packages"]
+                log("info", f"  retry: {' '.join(retry)}")
+                return subprocess.run(retry, timeout=300).returncode == 0
+            return False
+        except subprocess.TimeoutExpired:
+            log("error", f"pip install timed out for '{tool_name}'.")
             return False
 
     # Manual
@@ -534,6 +637,28 @@ def _manual_instructions(tool_name: str, family: str) -> str:
             "gentoo":    "    emerge --ask net-analyzer/nmap",
             "slackware": "    Download from: https://nmap.org/download.html",
             "default":   "    See: https://nmap.org/download.html",
+        },
+        "httpx": {
+            "default":   "    ProjectDiscovery httpx (NOT the Python pip 'httpx' client):\n"
+                         "      go install github.com/projectdiscovery/httpx/cmd/httpx@latest\n"
+                         "    On Kali it is packaged as 'httpx-toolkit': sudo apt install httpx-toolkit\n"
+                         "    Ensure $GOPATH/bin (~/go/bin) is in your PATH.",
+        },
+        "nuclei": {
+            "default":   "    go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest\n"
+                         "    Then run 'nuclei -update-templates' once to fetch templates.\n"
+                         "    Ensure $GOPATH/bin (~/go/bin) is in your PATH.",
+        },
+        "wafw00f": {
+            "default":   "    pipx install wafw00f   (or: pip install --user wafw00f)\n"
+                         "    Debian/Ubuntu/Kali    : sudo apt install wafw00f",
+        },
+        "sslscan": {
+            "gentoo":    "    emerge --ask net-analyzer/sslscan",
+            "default":   "    Debian/Ubuntu : sudo apt install sslscan\n"
+                         "    Fedora        : sudo dnf install sslscan\n"
+                         "    macOS         : brew install sslscan\n"
+                         "    Source        : https://github.com/rbsec/sslscan",
         },
     }
     tool_entry = INSTRUCTIONS.get(tool_name, {})
